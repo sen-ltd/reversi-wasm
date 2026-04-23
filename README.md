@@ -84,3 +84,10 @@ fn legal_moves_dir(me: u64, opp: u64, empty: u64, shift: Shift) -> u64 {
 ## License
 
 MIT. See `LICENSE`.
+
+<!-- sen-publish:links -->
+## Links
+
+- 🌐 Demo: https://sen.ltd/portfolio/reversi-wasm/
+- 📝 dev.to: https://dev.to/sendotltd/a-37-kb-othello-engine-bitboards-in-rust-raw-wasm-no-wasm-bindgen-353f
+<!-- /sen-publish:links -->
