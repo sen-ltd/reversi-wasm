@@ -1,0 +1,12 @@
+{
+  "name": "reversi-wasm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Reversi / Othello engine written in Rust, compiled to raw WebAssembly (no wasm-bindgen). Bitboards + alpha-beta pruning.",
+  "scripts": {
+    "build:wasm": "./build.sh",
+    "serve": "python3 -m http.server 8080"
+  },
+  "license": "MIT"
+}
