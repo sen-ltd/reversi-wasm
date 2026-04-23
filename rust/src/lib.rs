@@ -323,6 +323,19 @@ pub extern "C" fn apply_move(pos: u32) -> u32 {
     1
 }
 
+/// Overwrite the game state. Used by the JS host to implement undo by
+/// snapshotting `(black, white, turn)` before each move and restoring it
+/// on request. Trusts the caller — we don't validate that the triple
+/// represents a reachable position.
+#[no_mangle]
+pub extern "C" fn set_state(black: u64, white: u64, turn: u32) {
+    unsafe {
+        BLACK = black;
+        WHITE = white;
+        TURN = turn & 1;
+    }
+}
+
 /// Ask the AI for the best move at given depth. Returns 0-63 for a move,
 /// 64 if the AI must pass.
 #[no_mangle]

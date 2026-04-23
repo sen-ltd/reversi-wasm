@@ -1,6 +1,7 @@
-// UI shell for the Rust/WASM Reversi engine. Loads reversi.wasm, renders
-// the 8x8 board, routes clicks to the exported apply_move, and either
-// hands the next turn to the human or asks the AI for its move.
+// UI shell for the Rust/WASM Reversi engine. DOM is built once on boot;
+// subsequent state changes only mutate the bits that actually changed,
+// so the CSS `flip` animation only runs for newly-placed or newly-
+// flipped discs instead of every disc on the board.
 
 const WASM_URL = './assets/reversi.wasm';
 
@@ -9,22 +10,35 @@ let mode = 'ai-white'; // 'hvh' | 'ai-white' | 'ai-black'
 let aiDepth = 4;
 let aiThinking = false;
 
+// History stack for undo: each entry is { black, white, turn } as BigInts.
+// We push *before* any call to apply_move, so undoing = pop + set_state.
+const history = [];
+
+// Long-lived DOM refs. All populated by buildShell() on first boot.
+let boardEl = null;
+const cellEls = new Array(64);
+let scoreBlackEl = null;
+let scoreWhiteEl = null;
+let turnLabelEl = null;
+let msgEl = null;
+let passBtn = null;
+let undoBtn = null;
+
 async function boot() {
   const res = await fetch(WASM_URL);
   const bytes = await res.arrayBuffer();
   const { instance } = await WebAssembly.instantiate(bytes, {});
   engine = instance.exports;
   engine.reset();
-  render();
-  // If the AI is black (plays first), kick off its move.
+  buildShell();
+  update();
   maybeTriggerAi();
 }
 
-function render() {
+function buildShell() {
   const app = document.getElementById('app');
   app.innerHTML = '';
 
-  // --- Header ---
   const header = document.createElement('header');
   header.innerHTML = `
     <h1>Reversi</h1>
@@ -32,158 +46,226 @@ function render() {
   `;
   app.appendChild(header);
 
-  // --- Status row ---
   const status = document.createElement('section');
   status.className = 'status';
-  const black = engine.black_count();
-  const white = engine.white_count();
-  const turn = engine.current_turn();
-  const gameOver = engine.is_game_over() === 1;
   status.innerHTML = `
     <div class="score">
-      <span class="chip"><span class="disc-mini black"></span>${black}</span>
-      <span class="chip"><span class="disc-mini white"></span>${white}</span>
+      <span class="chip"><span class="disc-mini black"></span><span data-score-black>0</span></span>
+      <span class="chip"><span class="disc-mini white"></span><span data-score-white>0</span></span>
     </div>
-    <div class="turn-label">
-      ${
-        gameOver
-          ? black > white ? '黒の勝ち' : white > black ? '白の勝ち' : '引き分け'
-          : turn === 0 ? '黒の番' : '白の番'
-      }
-    </div>
+    <div class="turn-label" data-turn-label></div>
   `;
+  scoreBlackEl = status.querySelector('[data-score-black]');
+  scoreWhiteEl = status.querySelector('[data-score-white]');
+  turnLabelEl = status.querySelector('[data-turn-label]');
   app.appendChild(status);
 
-  // --- Board ---
-  const legal = engine.legal_moves_bits();
-  const blackBits = engine.black_discs();
-  const whiteBits = engine.white_discs();
-  const board = document.createElement('div');
-  board.className = 'board';
+  boardEl = document.createElement('div');
+  boardEl.className = 'board';
   for (let i = 0; i < 64; i++) {
     const cell = document.createElement('div');
     cell.className = 'cell';
-    const bit = 1n << BigInt(i);
-    const isLegal = !gameOver && !aiThinking && (legal & bit) !== 0n && isHumanTurn();
-    if (isLegal) {
-      cell.classList.add('legal');
-      cell.addEventListener('click', () => playHuman(i));
-    }
-    if ((blackBits & bit) !== 0n) {
-      const d = document.createElement('div');
-      d.className = 'disc black';
-      cell.appendChild(d);
-    } else if ((whiteBits & bit) !== 0n) {
-      const d = document.createElement('div');
-      d.className = 'disc white';
-      cell.appendChild(d);
-    }
-    board.appendChild(cell);
+    cell.dataset.pos = String(i);
+    cellEls[i] = cell;
+    boardEl.appendChild(cell);
   }
-  app.appendChild(board);
+  // Event delegation — one listener for all 64 cells, routed by dataset.
+  boardEl.addEventListener('click', onBoardClick);
+  app.appendChild(boardEl);
 
-  // --- Message row ---
-  const msg = document.createElement('div');
-  msg.className = 'message';
-  if (aiThinking) {
-    msg.textContent = 'AI 思考中…';
-  } else if (gameOver) {
-    msg.textContent = `最終スコア: 黒 ${black} - 白 ${white}`;
-  } else if (legal === 0n) {
-    const who = turn === 0 ? '黒' : '白';
-    msg.textContent = `${who}はパスします`;
-  }
-  app.appendChild(msg);
+  msgEl = document.createElement('div');
+  msgEl.className = 'message';
+  app.appendChild(msgEl);
 
-  // --- Controls ---
   const controls = document.createElement('section');
   controls.className = 'controls';
 
-  const passBtn = button('パス', () => {
-    if (engine.legal_moves_bits() !== 0n) return;
-    engine.apply_move(64);
-    render();
-    maybeTriggerAi();
-  });
-  passBtn.disabled = !(legal === 0n && !gameOver && isHumanTurn());
+  passBtn = document.createElement('button');
+  passBtn.type = 'button';
+  passBtn.textContent = 'パス';
+  passBtn.addEventListener('click', onPass);
   controls.appendChild(passBtn);
 
-  const resetBtn = button(
-    'リセット',
-    () => {
-      engine.reset();
-      aiThinking = false;
-      render();
-      maybeTriggerAi();
-    },
-    { primary: true },
-  );
+  undoBtn = document.createElement('button');
+  undoBtn.type = 'button';
+  undoBtn.textContent = '1 手戻る';
+  undoBtn.addEventListener('click', onUndo);
+  controls.appendChild(undoBtn);
+
+  const resetBtn = document.createElement('button');
+  resetBtn.type = 'button';
+  resetBtn.textContent = 'リセット';
+  resetBtn.className = 'primary';
+  resetBtn.addEventListener('click', onReset);
   controls.appendChild(resetBtn);
 
   app.appendChild(controls);
 
-  // --- Mode row ---
   const modeRow = document.createElement('section');
   modeRow.className = 'mode-row';
   modeRow.innerHTML = `
     <label>モード
-      <select id="mode">
-        <option value="ai-white" ${mode === 'ai-white' ? 'selected' : ''}>人 (黒) vs AI (白)</option>
-        <option value="ai-black" ${mode === 'ai-black' ? 'selected' : ''}>AI (黒) vs 人 (白)</option>
-        <option value="hvh" ${mode === 'hvh' ? 'selected' : ''}>人 vs 人</option>
+      <select data-mode>
+        <option value="ai-white">人 (黒) vs AI (白)</option>
+        <option value="ai-black">AI (黒) vs 人 (白)</option>
+        <option value="hvh">人 vs 人</option>
       </select>
     </label>
     <label>強さ
-      <select id="depth">
-        <option value="1" ${aiDepth === 1 ? 'selected' : ''}>弱</option>
-        <option value="3" ${aiDepth === 3 ? 'selected' : ''}>中</option>
-        <option value="4" ${aiDepth === 4 ? 'selected' : ''}>強</option>
-        <option value="5" ${aiDepth === 5 ? 'selected' : ''}>最強</option>
+      <select data-depth>
+        <option value="1">弱</option>
+        <option value="3">中</option>
+        <option value="4" selected>強</option>
+        <option value="5">最強</option>
       </select>
     </label>
   `;
-  modeRow.querySelector('#mode').addEventListener('change', (e) => {
+  const modeSel = modeRow.querySelector('[data-mode]');
+  modeSel.value = mode;
+  modeSel.addEventListener('change', (e) => {
     mode = e.target.value;
-    engine.reset();
-    render();
-    maybeTriggerAi();
+    onReset();
   });
-  modeRow.querySelector('#depth').addEventListener('change', (e) => {
+  modeRow.querySelector('[data-depth]').addEventListener('change', (e) => {
     aiDepth = Number(e.target.value);
-    render();
   });
   app.appendChild(modeRow);
 
   const footer = document.createElement('footer');
   footer.innerHTML = `
-    WASM ${engine.legal_moves_bits() !== undefined ? '✓' : '✗'} ·
+    WASM ✓ ·
     <a href="https://github.com/sen-ltd/reversi-wasm" target="_blank" rel="noopener">source</a> ·
     <a href="https://sen.ltd/" target="_blank" rel="noopener">SEN 合同会社</a>
   `;
   app.appendChild(footer);
 }
 
-function button(label, onClick, opts = {}) {
-  const b = document.createElement('button');
-  b.type = 'button';
-  b.textContent = label;
-  if (opts.primary) b.className = 'primary';
-  b.addEventListener('click', onClick);
-  return b;
+function update() {
+  const black = engine.black_discs();
+  const white = engine.white_discs();
+  const turn = engine.current_turn();
+  const legal = engine.legal_moves_bits();
+  const gameOver = engine.is_game_over() === 1;
+  const humansTurn = !gameOver && !aiThinking && isHumanTurn();
+
+  // Score
+  scoreBlackEl.textContent = String(engine.black_count());
+  scoreWhiteEl.textContent = String(engine.white_count());
+
+  // Turn label / game result
+  if (gameOver) {
+    const b = Number(engine.black_count());
+    const w = Number(engine.white_count());
+    turnLabelEl.textContent = b > w ? '黒の勝ち' : w > b ? '白の勝ち' : '引き分け';
+  } else {
+    turnLabelEl.textContent = turn === 0 ? '黒の番' : '白の番';
+  }
+
+  // Cells: only touch what actually changed. The flip animation is tied
+  // to the insertion of a new `.disc`, so untouched cells stay still.
+  for (let i = 0; i < 64; i++) {
+    const bit = 1n << BigInt(i);
+    const cell = cellEls[i];
+    const isBlack = (black & bit) !== 0n;
+    const isWhite = (white & bit) !== 0n;
+    const nextColor = isBlack ? 'black' : isWhite ? 'white' : null;
+
+    const existing = cell.firstElementChild;
+    const currentColor = existing
+      ? existing.classList.contains('black') ? 'black' : 'white'
+      : null;
+
+    if (currentColor !== nextColor) {
+      if (existing) existing.remove();
+      if (nextColor) {
+        const d = document.createElement('div');
+        d.className = `disc ${nextColor}`;
+        cell.appendChild(d);
+      }
+    }
+
+    // Toggle legal-move hint. Disable clicks with a sentinel class so
+    // the CSS doesn't paint a dot during the AI's turn.
+    const isLegal = humansTurn && (legal & bit) !== 0n;
+    cell.classList.toggle('legal', isLegal);
+  }
+
+  // Message line
+  if (aiThinking) {
+    msgEl.textContent = 'AI 思考中…';
+  } else if (gameOver) {
+    msgEl.textContent = `最終スコア: 黒 ${engine.black_count()} - 白 ${engine.white_count()}`;
+  } else if (legal === 0n) {
+    msgEl.textContent = `${turn === 0 ? '黒' : '白'}はパスします`;
+  } else {
+    msgEl.textContent = '';
+  }
+
+  // Controls
+  passBtn.disabled = !(legal === 0n && !gameOver && humansTurn);
+  undoBtn.disabled = aiThinking || history.length === 0;
+}
+
+function onBoardClick(e) {
+  const cell = e.target.closest('.cell');
+  if (!cell || !cell.classList.contains('legal')) return;
+  const pos = Number(cell.dataset.pos);
+  playHuman(pos);
+}
+
+function onPass() {
+  if (engine.legal_moves_bits() !== 0n) return;
+  pushHistory();
+  engine.apply_move(64);
+  update();
+  maybeTriggerAi();
+}
+
+function onUndo() {
+  if (aiThinking) return;
+  // In AI mode, undo rewinds past both the AI response and the human's
+  // move so control returns to the same "human to play" state as before.
+  // In HvH we only pop once.
+  do {
+    if (history.length === 0) return;
+    const prev = history.pop();
+    engine.set_state(prev.black, prev.white, prev.turn);
+  } while (!isHumanTurn() && history.length > 0);
+  update();
+}
+
+function onReset() {
+  engine.reset();
+  history.length = 0;
+  aiThinking = false;
+  update();
+  maybeTriggerAi();
 }
 
 function isHumanTurn() {
   const turn = engine.current_turn();
   if (mode === 'hvh') return true;
-  if (mode === 'ai-white') return turn === 0; // human plays black
-  if (mode === 'ai-black') return turn === 1; // human plays white
+  if (mode === 'ai-white') return turn === 0;
+  if (mode === 'ai-black') return turn === 1;
   return true;
+}
+
+function pushHistory() {
+  history.push({
+    black: engine.black_discs(),
+    white: engine.white_discs(),
+    turn: engine.current_turn(),
+  });
 }
 
 function playHuman(pos) {
   if (aiThinking || !isHumanTurn()) return;
-  if (engine.apply_move(pos) === 0) return;
-  render();
+  pushHistory();
+  if (engine.apply_move(pos) === 0) {
+    history.pop(); // rollback the snapshot if the move was illegal
+    return;
+  }
+  update();
   maybeTriggerAi();
 }
 
@@ -192,16 +274,16 @@ function maybeTriggerAi() {
   if (engine.is_game_over() === 1) return;
   if (isHumanTurn()) return;
   aiThinking = true;
-  render();
-  // Defer to next frame so the "thinking" UI paints before the search
+  update();
+  // Yield to the browser so the "thinking" UI paints before the search
   // hogs the main thread.
   requestAnimationFrame(() => {
     setTimeout(() => {
+      pushHistory();
       const pos = engine.ai_choose_move(aiDepth);
       engine.apply_move(pos);
       aiThinking = false;
-      render();
-      // The AI might still have to move if the human's forced pass followed.
+      update();
       maybeTriggerAi();
     }, 120);
   });
